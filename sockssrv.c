@@ -494,6 +494,7 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	server = &s;
+	dolog("Listening on %s:%d\n", listenip, port);
 
 	while(1) {
 		collect(threads);
