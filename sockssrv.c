@@ -113,15 +113,22 @@ struct thread {
 /* we log to stderr because it's not using line buffering, i.e. malloc which would need
    locking when called from different threads. for the same reason we use dprintf,
    which writes directly to an fd. */
-static inline void dolog(const char *fmt, ...) {
-    char t[32] = {};
-    struct tm tm_buf;
+static void dolog(const char *fmt, ...) {
+    char t[32];
+    struct tm *tm_buf;
     time_t secs = time(NULL);
+
+    if (quiet)
+        return;
 
     va_list args;
     va_start(args, fmt);
 
-    strftime(t, sizeof(t), "[%Y-%m-%d %T] ", localtime_r(&secs, &tm_buf));
+    tm_buf = localtime(&secs);
+    if (tm_buf)
+        strftime(t, sizeof(t), "[%Y-%m-%d %T] ", tm_buf);
+    else
+        t[0] = '\0';
     dprintf(fileno(stderr), "%s", t);
     vdprintf(fileno(stderr), fmt, args);
 
