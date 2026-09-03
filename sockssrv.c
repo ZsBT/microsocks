@@ -67,6 +67,7 @@
 #endif
 
 static int quiet, timeout;
+static volatile sig_atomic_t shutdown_signal;
 static const char* auth_user;
 static const char* auth_pass;
 static sblist* auth_ips;
@@ -388,6 +389,29 @@ static void* clientthread(void *data) {
 	return 0;
 }
 
+static void signal_handler(int sig) {
+	shutdown_signal = sig;
+	dolog("Caught signal %d\n", sig);
+}
+
+static int install_signal_handlers(void) {
+	struct sigaction action = {
+		.sa_handler = signal_handler,
+	};
+	sigemptyset(&action.sa_mask);
+	if(sigaction(SIGTERM, &action, 0) == -1) return -1;
+	if(sigaction(SIGINT, &action, 0) == -1) return -1;
+	return 0;
+}
+
+static void interrupt_clients(sblist *threads) {
+	size_t i;
+	for(i = 0; i < sblist_getsize(threads); i++) {
+		struct thread *thread = *((struct thread**)sblist_get(threads, i));
+		shutdown(thread->client.fd, SHUT_RDWR);
+	}
+}
+
 static void collect(sblist *threads) {
 	size_t i;
 	for(i=0;i<sblist_getsize(threads);) {
@@ -399,6 +423,22 @@ static void collect(sblist *threads) {
 		} else
 			i++;
 	}
+}
+
+static void cleanup(sblist *threads, struct server *s) {
+	while(sblist_getsize(threads)) {
+		collect(threads);
+		if(shutdown_signal == SIGINT)
+			interrupt_clients(threads);
+		if(sblist_getsize(threads))
+			usleep(FAILURE_TIMEOUT);
+	}
+	close(s->fd);
+	sblist_free(threads);
+	sblist_free(auth_ips);
+	free((char*)auth_user);
+	free((char*)auth_pass);
+	pthread_rwlock_destroy(&auth_ips_lock);
 }
 
 static int usage(void) {
@@ -498,24 +538,43 @@ int main(int argc, char** argv) {
 	signal(SIGPIPE, SIG_IGN);
 	struct server s;
 	sblist *threads = sblist_new(sizeof (struct thread*), 8);
+	if(!threads) {
+		dolog("failed to allocate thread list\n");
+		return 1;
+	}
+	if(install_signal_handlers() == -1) {
+		perror("sigaction");
+		sblist_free(threads);
+		return 1;
+	}
 	if(server_setup(&s, listenip, port)) {
 		perror("server_setup");
+		sblist_free(threads);
 		return 1;
 	}
 	server = &s;
 	dolog("Listening on %s:%d\n", listenip, port);
 
-	while(1) {
+	while(!shutdown_signal) {
 		collect(threads);
 		struct client c;
 		struct thread *curr = malloc(sizeof (struct thread));
 		if(!curr) goto oom;
 		curr->done = 0;
 		if(server_waitclient(&s, &c)) {
+			if(shutdown_signal) {
+				free(curr);
+				break;
+			}
 			dolog("failed to accept connection\n");
 			free(curr);
 			usleep(FAILURE_TIMEOUT);
 			continue;
+		}
+		if(shutdown_signal) {
+			close(c.fd);
+			free(curr);
+			break;
 		}
 		curr->client = c;
 		if(!sblist_add(threads, &curr)) {
@@ -540,4 +599,7 @@ int main(int argc, char** argv) {
 		}
 		if(a) pthread_attr_destroy(&attr);
 	}
+	dolog("Exiting gracefully.\n");
+	cleanup(threads, &s);
+	return 0;
 }
