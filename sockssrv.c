@@ -68,6 +68,7 @@
 
 static int quiet, timeout;
 static volatile sig_atomic_t shutdown_signal;
+static int interface_set, listenip_set;
 static const char* auth_user;
 static const char* auth_pass;
 static sblist* auth_ips;
@@ -394,6 +395,15 @@ static void signal_handler(int sig) {
 	dolog("Caught signal %d\n", sig);
 }
 
+static void log_listener(const struct sockaddr *addr) {
+	char host[NI_MAXHOST], service[NI_MAXSERV];
+	socklen_t addrlen = addr->sa_family == AF_INET ?
+		sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+	if(getnameinfo(addr, addrlen, host, sizeof(host), service, sizeof(service),
+		NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+		dolog("Listening on %s:%s\n", host, service);
+}
+
 static int install_signal_handlers(void) {
 	struct sigaction action = {
 		.sa_handler = signal_handler,
@@ -433,7 +443,7 @@ static void cleanup(sblist *threads, struct server *s) {
 		if(sblist_getsize(threads))
 			usleep(FAILURE_TIMEOUT);
 	}
-	close(s->fd);
+	server_close(s);
 	sblist_free(threads);
 	sblist_free(auth_ips);
 	free((char*)auth_user);
@@ -445,10 +455,12 @@ static int usage(void) {
 	dprintf(2,
 		"MicroSocks SOCKS5 Server\n"
 		"------------------------\n"
-		"usage: microsocks -1 -q -t timeout -i listenip -p port -u user -P pass -b bindaddr -w ips\n"
+		"usage: microsocks -1 -q -t timeout -i listenip -I interface -p port -u user -P pass -b bindaddr -w ips\n"
 		"all arguments are optional.\n"
 		"by default listenip is 0.0.0.0 and port 1080.\n\n"
 		"-q disables logging.\n"
+		"-I binds the listener to all addresses assigned to the named interface.\n"
+		"   -I and -i cannot be used together.\n"
 		"-b specifies which ip outgoing connections are bound to\n"
 		"-t timeout is specified in seconds, default 0.\n"
 		"   if timeout is set to 0, block until the OS signals activity.\n"
@@ -475,9 +487,10 @@ static void zero_arg(char *s) {
 int main(int argc, char** argv) {
 	int ch;
 	const char *listenip = "0.0.0.0";
+	const char *interface = 0;
 	char *p, *q;
 	unsigned port = 1080;
-	while((ch = getopt(argc, argv, ":1qb:t:i:p:u:P:w:")) != -1) {
+	while((ch = getopt(argc, argv, ":1qb:t:i:I:p:u:P:w:")) != -1) {
 		switch(ch) {
 			case 'w': /* fall-through */
 			case '1':
@@ -516,6 +529,11 @@ int main(int argc, char** argv) {
 				break;
 			case 'i':
 				listenip = optarg;
+				listenip_set = 1;
+				break;
+			case 'I':
+				interface = optarg;
+				interface_set = 1;
 				break;
 			case 'p':
 				port = atoi(optarg);
@@ -525,6 +543,10 @@ int main(int argc, char** argv) {
 				/* fall through */
 			case '?':
 				return usage();
+		}
+		if(interface_set && listenip_set) {
+			dprintf(2, "error: -I and -i cannot be used together\n");
+			return 1;
 		}
 	}
 	if((auth_user && !auth_pass) || (!auth_user && auth_pass)) {
@@ -547,13 +569,15 @@ int main(int argc, char** argv) {
 		sblist_free(threads);
 		return 1;
 	}
-	if(server_setup(&s, listenip, port)) {
-		perror("server_setup");
+	if(server_setup(&s, listenip, interface, port, log_listener)) {
+		if(interface)
+			dprintf(2, "error: failed to bind interface %s\n", interface);
+		else
+			perror("server_setup");
 		sblist_free(threads);
 		return 1;
 	}
 	server = &s;
-	dolog("Listening on %s:%d\n", listenip, port);
 
 	while(!shutdown_signal) {
 		collect(threads);

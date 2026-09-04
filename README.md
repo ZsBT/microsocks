@@ -41,13 +41,15 @@ libc is not even 50 KB. that's easily usable even on the cheapest routers.
 command line options
 --------------------
 
-    microsocks -1 -q -t timeout -i listenip -p port -u user -P passw -b bindaddr -w wl
+    microsocks -1 -q -t timeout -i listenip -I interface -p port -u user -P passw -b bindaddr -w wl
 
 ```
 all arguments are optional.
 by default listenip is 0.0.0.0 and port 1080.
 
 -q disables logging.
+-I binds the listener to all addresses assigned to the named network
+   interface. It cannot be combined with -i.
 -b specifies which ip outgoing connections are bound to
 -t timeout is specified in seconds, default 0.
    if timeout is set to 0, block until the OS signals activity.
