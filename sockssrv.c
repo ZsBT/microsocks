@@ -22,8 +22,8 @@
 */
 
 #define _GNU_SOURCE
-#include <unistd.h>
 #define _POSIX_C_SOURCE 200809L
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -66,7 +66,9 @@
 #define THREAD_STACK_SIZE 32*1024
 #endif
 
-static int quiet;
+static int quiet, timeout;
+static volatile sig_atomic_t shutdown_signal;
+static int interface_set, listenip_set;
 static const char* auth_user;
 static const char* auth_pass;
 static sblist* auth_ips;
@@ -104,6 +106,7 @@ struct thread {
 	struct client client;
 	enum socksstate state;
 	volatile int  done;
+	int remotefd;
 };
 
 #ifndef CONFIG_LOG
@@ -113,15 +116,22 @@ struct thread {
 /* we log to stderr because it's not using line buffering, i.e. malloc which would need
    locking when called from different threads. for the same reason we use dprintf,
    which writes directly to an fd. */
-static inline void dolog(const char *fmt, ...) {
-    char t[32] = {};
-    struct tm tm_buf;
+static void dolog(const char *fmt, ...) {
+    char t[32];
+    struct tm *tm_buf;
     time_t secs = time(NULL);
+
+    if (quiet)
+        return;
 
     va_list args;
     va_start(args, fmt);
 
-    strftime(t, sizeof(t), "[%Y-%m-%d %T] ", localtime_r(&secs, &tm_buf));
+    tm_buf = localtime(&secs);
+    if (tm_buf)
+        strftime(t, sizeof(t), "[%Y-%m-%d %T] ", tm_buf);
+    else
+        t[0] = '\0';
     dprintf(fileno(stderr), "%s", t);
     vdprintf(fileno(stderr), fmt, args);
 
@@ -288,10 +298,7 @@ static void copyloop(int fd1, int fd2) {
 	};
 
 	while(1) {
-		/* inactive connections are reaped after 15 min to free resources.
-		   usually programs send keep-alive packets so this should only happen
-		   when a connection is really unused. */
-		switch(poll(fds, 2, 60*15*1000)) {
+		switch(poll(fds, 2, timeout ? timeout*1000 : -1)) {
 			case 0:
 				return;
 			case -1:
@@ -375,6 +382,7 @@ static int handshake(struct thread *t) {
 static void* clientthread(void *data) {
 	struct thread *t = data;
 	int remotefd = handshake(t);
+	t->remotefd = remotefd;
 	if(remotefd != -1) {
 		copyloop(t->client.fd, remotefd);
 		close(remotefd);
@@ -382,6 +390,40 @@ static void* clientthread(void *data) {
 	close(t->client.fd);
 	t->done = 1;
 	return 0;
+}
+
+static void signal_handler(int sig) {
+	shutdown_signal = sig;
+	dolog("Caught signal %d\n", sig);
+}
+
+static void log_listener(const struct sockaddr *addr) {
+	char host[NI_MAXHOST], service[NI_MAXSERV];
+	socklen_t addrlen = addr->sa_family == AF_INET ?
+		sizeof(struct sockaddr_in) : sizeof(struct sockaddr_in6);
+	if(getnameinfo(addr, addrlen, host, sizeof(host), service, sizeof(service),
+		NI_NUMERICHOST | NI_NUMERICSERV) == 0)
+		dolog("Listening on %s:%s\n", host, service);
+}
+
+static int install_signal_handlers(void) {
+	struct sigaction action = {
+		.sa_handler = signal_handler,
+	};
+	sigemptyset(&action.sa_mask);
+	if(sigaction(SIGTERM, &action, 0) == -1) return -1;
+	if(sigaction(SIGINT, &action, 0) == -1) return -1;
+	return 0;
+}
+
+static void interrupt_clients(sblist *threads) {
+	size_t i;
+	for(i = 0; i < sblist_getsize(threads); i++) {
+		struct thread *thread = *((struct thread**)sblist_get(threads, i));
+		shutdown(thread->client.fd, SHUT_RDWR);
+		if(thread->remotefd >= 0)
+			shutdown(thread->remotefd, SHUT_RDWR);
+	}
 }
 
 static void collect(sblist *threads) {
@@ -397,25 +439,45 @@ static void collect(sblist *threads) {
 	}
 }
 
+static void cleanup(sblist *threads, struct server *s) {
+	while(sblist_getsize(threads)) {
+		collect(threads);
+		if(shutdown_signal == SIGINT)
+			interrupt_clients(threads);
+		if(sblist_getsize(threads))
+			usleep(FAILURE_TIMEOUT);
+	}
+	server_close(s);
+	sblist_free(threads);
+	sblist_free(auth_ips);
+	free((char*)auth_user);
+	free((char*)auth_pass);
+	pthread_rwlock_destroy(&auth_ips_lock);
+}
+
 static int usage(void) {
 	dprintf(2,
 		"MicroSocks SOCKS5 Server\n"
 		"------------------------\n"
-		"usage: microsocks -1 -q -i listenip -p port -u user -P pass -b bindaddr -w ips\n"
+		"usage: microsocks -1 -q -t timeout -i listenip -I interface -p port -u user -P pass -b bindaddr -w ips\n"
 		"all arguments are optional.\n"
 		"by default listenip is 0.0.0.0 and port 1080.\n\n"
-		"option -q disables logging.\n"
-		"option -b specifies which ip outgoing connections are bound to\n"
-		"option -w allows to specify a comma-separated whitelist of ip addresses,\n"
-		" that may use the proxy without user/pass authentication.\n"
-		" e.g. -w 127.0.0.1,192.168.1.1.1,::1 or just -w 10.0.0.1\n"
-		" to allow access ONLY to those ips, choose an impossible to guess user/pw combo.\n"
-		"option -1 activates auth_once mode: once a specific ip address\n"
-		" authed successfully with user/pass, it is added to a whitelist\n"
-		" and may use the proxy without auth.\n"
-		" this is handy for programs like firefox that don't support\n"
-		" user/pass auth. for it to work you'd basically make one connection\n"
-		" with another program that supports it, and then you can use firefox too.\n"
+		"-q disables logging.\n"
+		"-I binds the listener to all addresses assigned to the named interface.\n"
+		"   -I and -i cannot be used together.\n"
+		"-b specifies which ip outgoing connections are bound to\n"
+		"-t timeout is specified in seconds, default 0.\n"
+		"   if timeout is set to 0, block until the OS signals activity.\n"
+		"-w allows to specify a comma-separated whitelist of ip addresses,\n"
+		"   that may use the proxy without user/pass authentication.\n"
+		"   e.g. -w 127.0.0.1,192.168.1.1.1,::1 or just -w 10.0.0.1\n"
+		"   to allow access ONLY to those ips, choose impossible to guess user/pw combo.\n"
+		"-1 activates auth_once mode: once a specific ip address\n"
+		"   authed successfully with user/pass, it is added to a whitelist\n"
+		"   and may use the proxy without auth.\n"
+		"   this is handy for programs like firefox that don't support\n"
+		"   user/pass auth. for it to work you'd basically make one connection\n"
+		"   with another program that supports it, and then you can use firefox too.\n"
 	);
 	return 1;
 }
@@ -429,9 +491,10 @@ static void zero_arg(char *s) {
 int main(int argc, char** argv) {
 	int ch;
 	const char *listenip = "0.0.0.0";
+	const char *interface = 0;
 	char *p, *q;
 	unsigned port = 1080;
-	while((ch = getopt(argc, argv, ":1qb:i:p:u:P:w:")) != -1) {
+	while((ch = getopt(argc, argv, ":1qb:t:i:I:p:u:P:w:")) != -1) {
 		switch(ch) {
 			case 'w': /* fall-through */
 			case '1':
@@ -454,6 +517,9 @@ int main(int argc, char** argv) {
 			case 'q':
 				quiet = 1;
 				break;
+			case 't':
+				timeout = atoi(optarg);
+				break;
 			case 'b':
 				resolve_sa(optarg, 0, &bind_addr);
 				break;
@@ -467,6 +533,11 @@ int main(int argc, char** argv) {
 				break;
 			case 'i':
 				listenip = optarg;
+				listenip_set = 1;
+				break;
+			case 'I':
+				interface = optarg;
+				interface_set = 1;
 				break;
 			case 'p':
 				port = atoi(optarg);
@@ -476,6 +547,10 @@ int main(int argc, char** argv) {
 				/* fall through */
 			case '?':
 				return usage();
+		}
+		if(interface_set && listenip_set) {
+			dprintf(2, "error: -I and -i cannot be used together\n");
+			return 1;
 		}
 	}
 	if((auth_user && !auth_pass) || (!auth_user && auth_pass)) {
@@ -489,23 +564,46 @@ int main(int argc, char** argv) {
 	signal(SIGPIPE, SIG_IGN);
 	struct server s;
 	sblist *threads = sblist_new(sizeof (struct thread*), 8);
-	if(server_setup(&s, listenip, port)) {
-		perror("server_setup");
+	if(!threads) {
+		dolog("failed to allocate thread list\n");
+		return 1;
+	}
+	if(install_signal_handlers() == -1) {
+		perror("sigaction");
+		sblist_free(threads);
+		return 1;
+	}
+	if(server_setup(&s, listenip, interface, port, log_listener)) {
+		if(interface)
+			dprintf(2, "error: failed to bind interface %s\n", interface);
+		else
+			perror("server_setup");
+		sblist_free(threads);
 		return 1;
 	}
 	server = &s;
 
-	while(1) {
+	while(!shutdown_signal) {
 		collect(threads);
 		struct client c;
 		struct thread *curr = malloc(sizeof (struct thread));
 		if(!curr) goto oom;
 		curr->done = 0;
+		curr->remotefd = -1;
 		if(server_waitclient(&s, &c)) {
+			if(shutdown_signal) {
+				free(curr);
+				break;
+			}
 			dolog("failed to accept connection\n");
 			free(curr);
 			usleep(FAILURE_TIMEOUT);
 			continue;
+		}
+		if(shutdown_signal) {
+			close(c.fd);
+			free(curr);
+			break;
 		}
 		curr->client = c;
 		if(!sblist_add(threads, &curr)) {
@@ -521,8 +619,16 @@ int main(int argc, char** argv) {
 			a = &attr;
 			pthread_attr_setstacksize(a, THREAD_STACK_SIZE);
 		}
-		if(pthread_create(&curr->pt, a, clientthread, curr) != 0)
+		if(pthread_create(&curr->pt, a, clientthread, curr) != 0) {
+			sblist_delete(threads, sblist_getsize(threads)-1);
+			close(curr->client.fd);
+			free(curr);
 			dolog("pthread_create failed. OOM?\n");
+			usleep(FAILURE_TIMEOUT);
+		}
 		if(a) pthread_attr_destroy(&attr);
 	}
+	dolog("Exiting gracefully.\n");
+	cleanup(threads, &s);
+	return 0;
 }

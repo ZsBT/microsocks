@@ -5,6 +5,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <sys/socket.h>
+#include <stddef.h>
 #include <netdb.h>
 #include <netinet/in.h>
 
@@ -35,7 +36,9 @@ struct client {
 };
 
 struct server {
-	int fd;
+	int *fds;
+	size_t count;
+	void (*listener_log)(const struct sockaddr *addr);
 };
 
 int resolve(const char *host, unsigned short port, struct addrinfo** addr);
@@ -43,7 +46,8 @@ int resolve_sa(const char *host, unsigned short port, union sockaddr_union *res)
 int bindtoip(int fd, union sockaddr_union *bindaddr);
 
 int server_waitclient(struct server *server, struct client* client);
-int server_setup(struct server *server, const char* listenip, unsigned short port);
+int server_setup(struct server *server, const char* listenip, const char* interface, unsigned short port,
+	void (*listener_log)(const struct sockaddr *addr));
+void server_close(struct server *server);
 
 #endif
-
