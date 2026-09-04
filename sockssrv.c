@@ -22,8 +22,8 @@
 */
 
 #define _GNU_SOURCE
-#include <unistd.h>
 #define _POSIX_C_SOURCE 200809L
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -106,6 +106,7 @@ struct thread {
 	struct client client;
 	enum socksstate state;
 	volatile int  done;
+	int remotefd;
 };
 
 #ifndef CONFIG_LOG
@@ -381,6 +382,7 @@ static int handshake(struct thread *t) {
 static void* clientthread(void *data) {
 	struct thread *t = data;
 	int remotefd = handshake(t);
+	t->remotefd = remotefd;
 	if(remotefd != -1) {
 		copyloop(t->client.fd, remotefd);
 		close(remotefd);
@@ -419,6 +421,8 @@ static void interrupt_clients(sblist *threads) {
 	for(i = 0; i < sblist_getsize(threads); i++) {
 		struct thread *thread = *((struct thread**)sblist_get(threads, i));
 		shutdown(thread->client.fd, SHUT_RDWR);
+		if(thread->remotefd >= 0)
+			shutdown(thread->remotefd, SHUT_RDWR);
 	}
 }
 
@@ -585,6 +589,7 @@ int main(int argc, char** argv) {
 		struct thread *curr = malloc(sizeof (struct thread));
 		if(!curr) goto oom;
 		curr->done = 0;
+		curr->remotefd = -1;
 		if(server_waitclient(&s, &c)) {
 			if(shutdown_signal) {
 				free(curr);
